@@ -4,11 +4,29 @@
 
 #include <glslcross.hpp>
 
+#if GLSLCROSS_GLSL_TO_SPIRV_COMPILER
+#include <SPIRV/GlslangToSpv.h>
+#endif
+#include <glslang/Public/ShaderLang.h>
+#include <spirv_glsl.hpp>
+
+#include <stdexcept>
+
 namespace glslcross {
+
+static EShLanguage StageToEShLanguage(Stage stage) {
+    switch (stage) {
+        case Stage::Vertex: return EShLanguage::EShLangVertex;
+        case Stage::Fragment: return EShLanguage::EShLangFragment;
+        case Stage::Geometry: return EShLanguage::EShLangGeometry;
+    }
+    throw std::runtime_error("Unsupported stage");
+}
 
 #if GLSLCROSS_GLSL_TO_SPIRV_COMPILER
 static std::pair<bool, std::shared_ptr<glslang::TShader>> CompileShader(const std::string &text, EShLanguage type) {
     auto shader = std::make_shared<glslang::TShader>(type);
+    shader->setAutoMapLocations(true);
     const char *c = text.c_str();
     shader->setStrings(&c, 1);
     shader->setEnvInput(glslang::EShSource::EShSourceGlsl, type, glslang::EShClient::EShClientOpenGL,
@@ -21,88 +39,56 @@ static std::pair<bool, std::shared_ptr<glslang::TShader>> CompileShader(const st
 }
 #endif
 
-ShaderProgram::ShaderData::ShaderData(ShaderProgram::Stage stage) : stage(stage) {}
-
-const std::string &ShaderProgram::ShaderData::GetCrosscompiledSource() {
-    return crosscompiled_source;
-}
-
-ShaderProgram::ShaderProgram() {}
-
-ShaderProgram::ShaderData &ShaderProgram::GetShaderData(ShaderProgram::Stage stage) {
-    if (shaders.find(stage) == shaders.end()) {
-        shaders.emplace(stage, ShaderData(stage));
-    }
-    return shaders.at(stage);
-}
-
-const std::string &ShaderProgram::GetInfoLog() {
-    return info_log;
-}
-
-bool ShaderProgram::Crosscompile(int target_version, bool es) {
-    bool initialized = false;
-
+std::map<Stage, std::vector<uint32_t>> SourceToSpirv(const std::map<Stage, std::string> &sources) {
 #if GLSLCROSS_GLSL_TO_SPIRV_COMPILER
+    glslang::InitializeProcess();
+
     glslang::TProgram program;
-    info_log.clear();
-
-    std::vector<std::shared_ptr<glslang::TShader>> ref_holder;
-    for (auto &p : shaders) {
-        ShaderData &data = p.second;
-        if (data.spirv.empty()) {
-            if (data.source.empty()) continue;
-            if (!initialized) {
-                glslang::InitializeProcess();
-                initialized = true;
-            }
-            auto result = CompileShader(data.source, (EShLanguage) data.stage);
-            ref_holder.push_back(result.second);
-            if (!result.first) {
-                glslang::FinalizeProcess();
-                info_log = result.second->getInfoLog();
-                return false;
-            }
-            program.addShader(result.second.get());
-        }
-    }
-
-    if (initialized) {
-        if (!program.link(EShMessages::EShMsgDefault)) {
+    std::map<Stage, std::shared_ptr<glslang::TShader>> tshaders;
+    for (auto &s : sources) {
+        auto result = CompileShader(s.second, StageToEShLanguage(s.first));
+        tshaders[s.first] = result.second;
+        if (!result.first) {
             glslang::FinalizeProcess();
-            info_log = program.getInfoLog();
-            return false;
+            throw std::runtime_error("Can't compile shader:\n" + std::string(result.second->getInfoLog()));
         }
+        program.addShader(result.second.get());
     }
-#endif
 
-    for (auto &p : shaders) {
-        ShaderData &data = p.second;
-        if (data.spirv.empty()) {
-#if GLSLCROSS_GLSL_TO_SPIRV_COMPILER
-            auto intermediate = program.getIntermediate((EShLanguage) data.stage);
-            data.spirv.clear();
-            glslang::GlslangToSpv(*intermediate, data.spirv);
+    if (!program.link(EShMessages::EShMsgDefault)) {
+        glslang::FinalizeProcess();
+        throw std::runtime_error("Can't link shader:\n" + std::string(program.getInfoLog()));
+    }
+
+    std::map<Stage, std::vector<uint32_t>> result;
+    for (auto &s : sources) {
+        auto intermediate = program.getIntermediate(StageToEShLanguage(s.first));
+        glslang::GlslangToSpv(*intermediate, result[s.first]);
+    }
+
+    glslang::FinalizeProcess();
+
+    return result;
 #else
-            continue;
+    static_assert(false, "GLSL to SPIRV compilation disabled (define GLSLCROSS_GLSL_TO_SPIRV_COMPILER)");
 #endif
-        }
-        spirv_cross::CompilerGLSL glsl(data.spirv);
+}
+
+std::map<Stage, std::string>SpirvToSource(
+        const std::map<Stage, std::vector<uint32_t>> &spirv, int version, bool es) {
+
+    std::map<Stage, std::string> result;
+
+    for (auto &s : spirv) {
+        spirv_cross::CompilerGLSL glsl(s.second);
         spirv_cross::CompilerGLSL::Options options;
-        options.version = target_version;
+        options.version = version;
         options.es = es;
         glsl.set_common_options(options);
-        data.crosscompiled_source = glsl.compile();
+        result[s.first] = glsl.compile();
     }
 
-#if GLSLCROSS_GLSL_TO_SPIRV_COMPILER
-    if (initialized) {
-        glslang::FinalizeProcess();
-    }
-#endif
-
-    return true;
+    return result;
 }
-
 
 }
