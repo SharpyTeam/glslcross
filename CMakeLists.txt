@@ -3,6 +3,7 @@ project(glslcross)
 
 set(CMAKE_CXX_STANDARD 17)
 
+set(ENABLE_HLSL FALSE)
 add_subdirectory(deps/glslang)
 add_subdirectory(deps/SPIRV-Cross)
 add_library(glslcross STATIC src/glslcross.cpp include/glslcross.hpp)
